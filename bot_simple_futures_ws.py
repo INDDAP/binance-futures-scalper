@@ -29,7 +29,7 @@ import pytz
 
 from binance.client import Client
 from binance.enums import *
-from binance.streams import ThreadedWebsocketManager  # WebSocket manager
+from binance import ThreadedWebsocketManager  # WebSocket manager
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BOT CONFIGURATION
