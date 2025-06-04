@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-Live-trading BTC/USDT futures scalping bot on Binance USDT-M Futures.
-Implements the “zero-loss, multi-timeframe, 5m” strategy at 100× leverage.
-Exposes both “/” and “/health” endpoints bound to Render’s PORT.
+WebSocket‐driven BTC/USDT futures scalping bot on Binance USDT-M Futures.
+Uses a 5m‐kline WebSocket (ThreadedWebsocketManager) to receive each closed 5m bar instantly.
+All other indicators (15m, 1d, ATR, RSI, ADX, VWAP, pivot, engulfing) are computed on-the-fly.
+Exposes both "/" and "/health" endpoints on the PORT provided by Render (or default 8000 locally).
 
 Instructions:
- 1. pip install -r requirements.txt
- 2. Set environment variables in Render’s dashboard:
+ 1) pip install -r requirements.txt
+ 2) Set environment variables in Render (or locally):
       BINANCE_API_KEY    <your_live_api_key>
       BINANCE_API_SECRET <your_live_api_secret>
- 3. Render will automatically set $PORT for us—no changes needed in your run command.
- 4. In Render’s “Health Check” settings, point to “/”.  Render will poll “/” every 15s or so.
- 5. Once deployed, Render will keep this process alive 24/7 as long as it responds 200 on “/”.
-
-How it works:
-  • At startup: fetches any “*USDT” balances (e.g. USDT, LDUSDT, FDUSDT) in your Futures wallet.
-  • Every 5 minutes: downloads fresh 5m/15m/1d klines, recalculates indicators, checks entry & exit.
-  • Places real MARKET orders on Binance Futures if conditions are met.
-  • Health endpoint: listening on “/” and “/health” → returns 200 OK.
+ 3) Run: python3 bot_simple_futures_ws.py
+ 4) Render will automatically set $PORT; locally, it defaults to 8000.
+ 5) Health checks to "/" or "/health" keep the service alive.
 """
 
 import os
@@ -31,8 +26,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pandas as pd
 import numpy as np
 import pytz
+
 from binance.client import Client
 from binance.enums import *
+from binance.streams import ThreadedWebsocketManager  # WebSocket manager
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BOT CONFIGURATION
@@ -46,14 +43,12 @@ MAX_BARS   = 10         # Breakeven exit after 10 bars
 TIME_5MIN  = "5m"
 TIME_15MIN = "15min"
 TIME_1DAY  = "1d"
-LOOKBACK_5 = 500
-LOOKBACK_1D= 10
+LOOKBACK_5 = 500        # we keep a rolling window of 500 bars
 
 QTY_PREC   = 6
 PRICE_PREC = 2
 
-SLEEP_SEC  = 5
-BUFFER_SEC = 5
+SLEEP_SEC  = 1
 TZ_UTC     = pytz.UTC
 
 logging.basicConfig(
@@ -78,7 +73,14 @@ bot_state = {
     "entry_time": None
 }
 
-client = Client(API_KEY, API_SECRET)   # LIVE Futures client
+# This global DataFrame will hold our rolling 5m candles
+df5 = pd.DataFrame(
+    columns=["open","high","low","close","volume"],
+    index=pd.DatetimeIndex([], tz=TZ_UTC)
+)
+
+# Instantiate a Futures REST client (for orders, 15m/1d fetches, etc.)
+client = Client(API_KEY, API_SECRET)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -93,48 +95,27 @@ def floor_price(price_raw: float) -> float:
     factor = 10 ** PRICE_PREC
     return math.floor(price_raw * factor) / factor
 
-def sleep_until_next_5min():
-    now = datetime.now(TZ_UTC)
-    secs = now.timestamp()
-    next_300 = (int(secs // 300) + 1) * 300
-    target = datetime.fromtimestamp(next_300 + BUFFER_SEC, tz=TZ_UTC)
-    delay = (target - now).total_seconds()
-    if delay > 0:
-        time.sleep(delay)
-    else:
-        time.sleep(SLEEP_SEC)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-#  FETCH 5m, 15m, 1d KLINES
+#  FETCH 15m & 1d KLINES (REST)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fetch_5min_klines() -> pd.DataFrame:
-    raw = client.futures_klines(symbol=SYMBOL, interval=TIME_5MIN, limit=LOOKBACK_5)
-    df = pd.DataFrame(raw, columns=[
-        "open_time","open","high","low","close","volume",
-        "close_time","quote_asset_volume","num_trades",
-        "taker_buy_base_asset_vol","taker_buy_quote_asset_vol","ignore"
-    ])
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-    df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    df.set_index("open_time", inplace=True)
-    df.index = df.index.tz_convert(TZ_UTC)
-    return df[["open","high","low","close","volume"]]
-
-def fetch_15min_from_5min(df5: pd.DataFrame) -> pd.DataFrame:
+def fetch_15min_from_5min(local_df5: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given our rolling 5m DataFrame, resample into 15m bars.
+    """
     df15 = pd.DataFrame()
-    df15["open"]   = df5["open"].resample(TIME_15MIN).first()
-    df15["high"]   = df5["high"].resample(TIME_15MIN).max()
-    df15["low"]    = df5["low"].resample(TIME_15MIN).min()
-    df15["close"]  = df5["close"].resample(TIME_15MIN).last()
-    df15["volume"] = df5["volume"].resample(TIME_15MIN).sum()
+    df15["open"]   = local_df5["open"].resample(TIME_15MIN).first()
+    df15["high"]   = local_df5["high"].resample(TIME_15MIN).max()
+    df15["low"]    = local_df5["low"].resample(TIME_15MIN).min()
+    df15["close"]  = local_df5["close"].resample(TIME_15MIN).last()
+    df15["volume"] = local_df5["volume"].resample(TIME_15MIN).sum()
     return df15.dropna()
 
 def fetch_1d_klines() -> pd.DataFrame:
-    raw = client.futures_klines(symbol=SYMBOL, interval=TIME_1DAY, limit=LOOKBACK_1D)
+    """
+    Fetch the last few 1-day candles (we only need ~2–3 to compute yesterday's pivot).
+    """
+    raw = client.futures_klines(symbol=SYMBOL, interval=TIME_1DAY, limit=10)
     df = pd.DataFrame(raw, columns=[
         "open_time","open","high","low","close","volume",
         "close_time","quote_asset_volume","num_trades",
@@ -149,11 +130,15 @@ def fetch_1d_klines() -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  COMPUTE ALL INDICATORS AT ONCE
+#  COMPUTE ALL INDICATORS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_indicators(df5: pd.DataFrame, df15: pd.DataFrame, df1d: pd.DataFrame) -> pd.DataFrame:
-    df = df5.copy().sort_index()
+def compute_indicators(
+    local_df5: pd.DataFrame,
+    df15: pd.DataFrame,
+    df1d: pd.DataFrame
+) -> pd.DataFrame:
+    df = local_df5.copy().sort_index()
 
     # 1) EMA9, EMA21, EMA50 on 5m closes
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
@@ -227,7 +212,7 @@ def compute_indicators(df5: pd.DataFrame, df15: pd.DataFrame, df1d: pd.DataFrame
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ORDER HELPERS
+#  ORDER HELPERS (REST)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def place_market_buy(qty: float):
@@ -282,11 +267,20 @@ def place_limit_breakeven(qty: float, price: float, timeout: float = 2.0):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  STRATEGY MAIN LOGIC
+#  STRATEGY MAIN LOGIC (called on each new closed 5m bar)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_strategy(df_ind: pd.DataFrame):
+def run_strategy(local_df5: pd.DataFrame):
+    """
+    Called the moment a 5m bar closes (inside the WebSocket callback).
+    Computes indicators on the updated df5, then tries exit or entry.
+    """
     global bot_state
+
+    # We assume local_df5 is already sorted by index, with the latest closed bar at the end
+    df15 = fetch_15min_from_5min(local_df5)
+    df1d = fetch_1d_klines()
+    df_ind = compute_indicators(local_df5, df15, df1d)
     row = df_ind.iloc[-1]
     ts  = row.name
     price      = float(row["close"])
@@ -299,7 +293,7 @@ def run_strategy(df_ind: pd.DataFrame):
         tp   = bot_state["take_profit"]
         qty  = bot_state["quantity"]
 
-        # 1) Take-profit reached
+        # 1) TP reached
         if high_price >= tp:
             try:
                 place_market_sell(qty)
@@ -324,7 +318,7 @@ def run_strategy(df_ind: pd.DataFrame):
             })
             return
 
-        # 2) 10 bars expired → breakeven exit
+        # 2) Breakeven after MAX_BARS
         elif bot_state["bars_held"] >= MAX_BARS:
             try:
                 place_limit_breakeven(qty, ep, timeout=2.0)
@@ -333,7 +327,7 @@ def run_strategy(df_ind: pd.DataFrame):
                 logging.error(f"Breakeven limit-sell failed: {e}")
                 return
 
-            logging.info(f"Breakeven: Sold {qty:.6f} @ {ep:.2f} (P/L=0); Equity={bot_state['equity']:.2f}")
+            logging.info(f"Breakeven: Sold {qty:.6f} @ {ep:.2f} (P/L=0) → Equity={bot_state['equity']:.2f}")
             bot_state.update({
                 "in_position": False,
                 "bars_held": 0,
@@ -403,6 +397,83 @@ def run_strategy(df_ind: pd.DataFrame):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  WEBSOCKET CALLBACK: APPEND NEW 5m BAR, TRIGGER run_strategy
+# ──────────────────────────────────────────────────────────────────────────────
+
+def handle_kline_message(msg):
+    """
+    Called by ThreadedWebsocketManager whenever a 5m kline closes.
+    We append that one new bar to df5, drop the oldest, then run_strategy().
+    """
+    # Only process “kline closed” events
+    k = msg.get("k", {})
+    if not k or not k.get("x", False):
+        return
+
+    open_time = pd.to_datetime(k["t"], unit="ms", utc=True).tz_convert(TZ_UTC)
+    new_row = {
+        "open":  float(k["o"]),
+        "high":  float(k["h"]),
+        "low":   float(k["l"]),
+        "close": float(k["c"]),
+        "volume": float(k["v"])
+    }
+
+    global df5
+    # Append the new row
+    df5.loc[open_time] = [
+        new_row["open"],
+        new_row["high"],
+        new_row["low"],
+        new_row["close"],
+        new_row["volume"]
+    ]
+    # Keep only the last LOOKBACK_5 rows
+    if len(df5) > LOOKBACK_5:
+        df5 = df5.iloc[-LOOKBACK_5 :]
+
+    # Once we have LOOKBACK_5 bars, run the strategy
+    if len(df5) == LOOKBACK_5:
+        run_strategy(df5)
+
+
+def start_kline_stream():
+    """
+    1) Seed df5 with the last LOOKBACK_5 bars via REST.
+    2) Launch the WebSocket (ThreadedWebsocketManager) to receive each closed 5m bar.
+    3) keep thread alive indefinitely.
+    """
+    global df5
+
+    # 1) Seed via REST (fetch last LOOKBACK_5 bars at once)
+    raw = client.futures_klines(symbol=SYMBOL, interval=TIME_5MIN, limit=LOOKBACK_5)
+    temp = pd.DataFrame(raw, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_asset_volume","num_trades",
+        "taker_buy_base_asset_vol","taker_buy_quote_asset_vol","ignore"
+    ])
+    for c in ["open","high","low","close","volume"]:
+        temp[c] = temp[c].astype(float)
+    temp["open_time"] = pd.to_datetime(temp["open_time"], unit="ms", utc=True)
+    temp.set_index("open_time", inplace=True)
+    temp.index = temp.index.tz_convert(TZ_UTC)
+    temp = temp[["open","high","low","close","volume"]]
+
+    df5 = temp.copy()  # Now df5 has exactly LOOKBACK_5 rows
+
+    # 2) Start WebSocket listener in this thread
+    twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+    twm.start()
+
+    twm.start_kline_socket(
+        callback=handle_kline_message,
+        symbol=SYMBOL,
+        interval=TIME_5MIN
+    )
+    twm.join()  # blocks forever, keeping the socket open
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  HEALTH SERVER (responds on "/" and "/health")
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -426,7 +497,6 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 def start_health_server():
-    # Render will set $PORT. If PORT is missing (e.g. local test), default to 8000.
     raw_port = os.getenv("PORT", "8000")
     try:
         PORT = int(raw_port)
@@ -439,11 +509,11 @@ def start_health_server():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MAIN LOOP
+#  MAIN: Fetch initial balance → Start health server → Start kline stream
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1) Fetch any “*USDT” balances at startup
+    # 1) Fetch and sum any “*USDT” Futures balances at startup
     try:
         bal_list = client.futures_account_balance()
         usdt_bal = 0.0
@@ -461,26 +531,16 @@ def main():
     bot_state["equity"] = usdt_bal
     logging.info(f"Starting equity: {bot_state['equity']:.2f} USDT")
 
-    # 2) Enter the 5-minute loop
+    # 2) Launch health-check HTTP server in daemon thread
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # 3) Start the 5m WebSocket stream (blocks forever)
+    start_kline_stream()
+
+    # The code will never reach here; the stream + server threads run indefinitely.
     while True:
-        try:
-            sleep_until_next_5min()
-
-            df5   = fetch_5min_klines()
-            df15  = fetch_15min_from_5min(df5)
-            df1d  = fetch_1d_klines()
-            df_ind= compute_indicators(df5, df15, df1d)
-
-            run_strategy(df_ind)
-        except Exception as main_e:
-            logging.error(f"MAIN LOOP ERROR: {main_e}")
-            time.sleep(SLEEP_SEC)
-            continue
-
         time.sleep(SLEEP_SEC)
 
 
 if __name__ == "__main__":
-    # Start Health server in a background thread
-    threading.Thread(target=start_health_server, daemon=True).start()
     main()
