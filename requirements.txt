@@ -1,0 +1,6 @@
+python-binance
+pandas
+numpy
+pytz
+cryptography
+requests
