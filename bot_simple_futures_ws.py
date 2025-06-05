@@ -397,6 +397,7 @@ def run_strategy(local_df5: pd.DataFrame):
     bull_eng = bool(row["bull_engulf"])
     atr      = float(row["atr14"])
 
+    # Compute each boolean flag
     cond_ema    = (ema9 > ema21 > ema50)
     cond_mom    = (adx > 20) and (rsi > 55)
     cond_15     = (price > ema50_15)
@@ -404,6 +405,7 @@ def run_strategy(local_df5: pd.DataFrame):
     cond_pivot  = (price > pivot_val)
     cond_candle = bull_eng
 
+    # If all flags are true and ATR is valid, enter
     if all([cond_ema, cond_mom, cond_15, cond_vwap, cond_pivot, cond_candle]) and atr > 0:
         entry_price = price
         take_profit = entry_price + ATR_MULT * atr
@@ -436,7 +438,13 @@ def run_strategy(local_df5: pd.DataFrame):
             "entry_time": ts
         })
     else:
-        logging.info("Entry check skipped.")
+        # Detailed logging of which conditions passed/failed
+        logging.info(
+            f"Entry conditions not met: "
+            f"EMA_stack={cond_ema}, ADX_RSI={cond_mom}, "
+            f"15min_trend={cond_15}, VWAP={cond_vwap}, "
+            f"Pivot={cond_pivot}, Engulf={cond_candle} → skipping entry"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
