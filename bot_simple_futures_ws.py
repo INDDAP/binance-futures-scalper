@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
+"""
+WebSocket-driven BTC/USDT futures scalping bot on Binance USDT-M Futures.
+Uses a 5m-kline WebSocket (ThreadedWebsocketManager) to receive each closed 5m bar instantly.
+Caches balance once every 3 hours and daily pivot once per UTC day to avoid REST rate limits.
+Exposes both "/" and "/health" endpoints on the PORT provided by Render (or defaults to 8000 locally).
+
+Setup:
+ 1) pip install -r requirements.txt
+ 2) Set environment variables:
+      BINANCE_API_KEY    <your_live_api_key>
+      BINANCE_API_SECRET <your_live_api_secret>
+ 3) Run: python3 bot_simple_futures_ws.py
+"""
 
 import os
 import time
 import math
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pandas as pd
@@ -14,7 +27,7 @@ import pytz
 
 from binance.client import Client
 from binance.enums import *
-from binance import ThreadedWebsocketManager  # instead of binance.streams
+from binance import ThreadedWebsocketManager  # WebSocket manager
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  BOT CONFIGURATION & GLOBALS
@@ -54,39 +67,67 @@ bot_state = {
     "entry_time": None
 }
 
-# In‐memory 5m DataFrame (we will seed it once at startup and then append bars via WebSocket)
+# In-memory 5m DataFrame (seeded once at startup, then appended via WebSocket)
 df5 = pd.DataFrame(
     columns=["open","high","low","close","volume"],
     index=pd.DatetimeIndex([], tz=TZ_UTC)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  DAILY PIVOT CACHE
+#  CACHES FOR BALANCE AND DAILY PIVOT
 # ──────────────────────────────────────────────────────────────────────────────
 
-# This dict will store the last pivot value and the date (UTC) it applies to:
-pivot_cache = {
-    "date": None,   # pd.Timestamp (UTC, floored to midnight) of “yesterday”
-    "value": None   # float: pivot = (H + L + C)/3 for that “yesterday”
+# Balance cache: fetch once every 3 hours
+balance_cache = {
+    "last_fetched": None,  # datetime (UTC)
+    "value": None          # float
 }
+
+# Daily pivot cache: fetch once per UTC day
+pivot_cache = {
+    "date": None,    # pd.Timestamp (UTC, floored to midnight) representing "yesterday"
+    "value": None    # float: pivot for that date
+}
+
+
+def get_cached_balance():
+    """
+    Fetch futures USDT balance once every 3 hours. Reuse cached value otherwise.
+    """
+    global balance_cache
+
+    now_utc = datetime.now(pytz.UTC)
+    if (balance_cache["last_fetched"] is None or
+        (now_utc - balance_cache["last_fetched"]) > timedelta(hours=3)):
+        try:
+            bal_list = client.futures_account_balance()
+            usdt_total = sum(
+                float(entry["balance"]) for entry in bal_list if entry["asset"].endswith("USDT")
+            )
+            balance_cache["value"] = usdt_total if usdt_total > 0 else 1000.0
+            balance_cache["last_fetched"] = now_utc
+        except Exception as e:
+            logging.error(f"Could not fetch balance: {e}")
+            if balance_cache["value"] is None:
+                balance_cache["value"] = 1000.0
+            balance_cache["last_fetched"] = now_utc
+    return balance_cache["value"]
+
 
 def fetch_daily_pivot():
     """
     Returns yesterday's pivot = (prev_high + prev_low + prev_close)/3.
-    Caches result so we only call REST once per day.
+    Caches result so we only call REST once per UTC day.
     """
     global pivot_cache
 
-    # Determine 'today at midnight (UTC)' and 'yesterday at midnight'
-    now_utc    = datetime.now(pytz.UTC)
-    today_mid  = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday  = today_mid - pd.Timedelta(days=1)  # pivot date
+    now_utc = datetime.now(pytz.UTC)
+    today_mid = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today_mid - pd.Timedelta(days=1)
 
-    # If our cache is already for this 'yesterday', return it
     if pivot_cache["date"] == yesterday:
         return pivot_cache["value"]
 
-    # Otherwise: we need to fetch 1d klines (just once) and compute the pivot.
     try:
         raw_1d = client.futures_klines(symbol=SYMBOL, interval="1d", limit=3)
         df1d = pd.DataFrame(raw_1d, columns=[
@@ -96,7 +137,6 @@ def fetch_daily_pivot():
         ])
         for c in ["open","high","low","close","volume"]:
             df1d[c] = df1d[c].astype(float)
-
         df1d["open_time"] = pd.to_datetime(df1d["open_time"], unit="ms", utc=True)
         df1d.set_index("open_time", inplace=True)
         df1d.index = df1d.index.tz_convert(TZ_UTC).floor("D")
@@ -107,15 +147,16 @@ def fetch_daily_pivot():
         row = df1d.loc[yesterday]
         pivot_val = (row["high"] + row["low"] + row["close"]) / 3.0
 
-        # Update cache
-        pivot_cache["date"]  = yesterday
+        pivot_cache["date"] = yesterday
         pivot_cache["value"] = pivot_val
         return pivot_val
 
     except Exception as e:
         logging.error(f"Failed to fetch daily pivot: {e}")
-        # If we already had a pivot cached, return it; else default to 0
-        return pivot_cache["value"] if pivot_cache["value"] is not None else 0.0
+        if pivot_cache["value"] is not None:
+            return pivot_cache["value"]
+        else:
+            return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,7 +187,7 @@ def get_15m_from_5m(local_df5: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  PLACE ORDERS (REST)
+#  ORDER HELPERS (REST)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def place_market_buy(qty: float):
@@ -201,10 +242,10 @@ def place_limit_breakeven(qty: float, price: float, timeout: float = 2.0):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  INDICATOR CALCULATIONS (identical to your previous implementation)
+#  INDICATOR CALCULATIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame):
+def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFrame:
     df = local_df5.copy().sort_index()
 
     # 1) EMA 9/21/50 (5m)
@@ -277,13 +318,13 @@ def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame):
 def run_strategy(local_df5: pd.DataFrame):
     global bot_state
 
-    # First, get the pivot (cached, calls REST only once/day)
+    # 1) Get cached daily pivot
     pivot_val = fetch_daily_pivot()
 
-    # Next, build a 15m DataFrame by resampling local_df5
+    # 2) Build 15m DataFrame by resampling local_df5
     df15 = get_15m_from_5m(local_df5)
 
-    # Compute all indicators (5m + the resampled 15m EMA50)
+    # 3) Compute indicators (5m + 15m EMA50)
     df_ind = compute_indicators(local_df5, df15)
     row    = df_ind.iloc[-1]
     ts     = row.name
@@ -403,6 +444,9 @@ def run_strategy(local_df5: pd.DataFrame):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def handle_kline_message(msg):
+    """
+    Called whenever a 5m kline closes. Appends to df5 and triggers run_strategy.
+    """
     k = msg.get("k", {})
     if not k.get("x", False):
         return
@@ -432,9 +476,13 @@ def handle_kline_message(msg):
 
 
 def start_kline_stream():
+    """
+    1) Seed df5 with the last LOOKBACK_5 bars via REST.
+    2) Start the WebSocket to receive new 5m bars.
+    """
     global df5
 
-    # ── 1) Seed 5m via REST ───────────────────────────────────────────────────
+    # Seed 5m bars via REST
     raw = client.futures_klines(symbol=SYMBOL, interval="5m", limit=LOOKBACK_5)
     temp = pd.DataFrame(raw, columns=[
         "open_time","open","high","low","close","volume",
@@ -450,7 +498,7 @@ def start_kline_stream():
 
     df5 = temp.copy()
 
-    # ── 2) Launch the WebSocket (5m only) ─────────────────────────────────────
+    # Start WebSocket (5m klines)
     twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
     twm.start()
     twm.start_kline_socket(
@@ -462,7 +510,7 @@ def start_kline_stream():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  HEALTH SERVER (unchanged)
+#  HEALTH SERVER (responds on "/" and "/health")
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -484,6 +532,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+
 def start_health_server():
     raw_port = os.getenv("PORT", "8000")
     try:
@@ -501,21 +550,10 @@ def start_health_server():
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1) Fetch initial USDT futures balance
-    try:
-        bal_list = client.futures_account_balance()
-        usdt_bal = sum(
-            float(ent["balance"]) for ent in bal_list if ent["asset"].endswith("USDT")
-        )
-        if usdt_bal <= 0:
-            logging.warning("No USDT‐denominated balance found—defaulting to 1000 USDT.")
-            usdt_bal = 1000.0
-    except Exception as e:
-        logging.error(f"Could not fetch futures balance: {e}")
-        usdt_bal = 1000.0
-
-    bot_state["equity"] = usdt_bal
-    logging.info(f"Starting equity: {usdt_bal:.2f} USDT")
+    # 1) Fetch initial balance (cached, once per 3 hours)
+    initial_balance = get_cached_balance()
+    bot_state["equity"] = initial_balance
+    logging.info(f"Starting equity: {initial_balance:.2f} USDT")
 
     # 2) Start health server in background
     threading.Thread(target=start_health_server, daemon=True).start()
@@ -523,6 +561,7 @@ def main():
     # 3) Start the 5m WebSocket stream (blocks forever)
     start_kline_stream()
 
+    # Keep the main thread alive
     while True:
         time.sleep(SLEEP_SEC)
 
