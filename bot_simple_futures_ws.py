@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-WebSocket-driven BTC/USDT futures scalping bot on Binance USDT-M Futures.
-Uses a 5m-kline WebSocket (ThreadedWebsocketManager) to receive each closed 5m bar instantly.
+WebSocket‐driven BTC/USDT futures scalping bot on Binance USDT‐M Futures.
+Uses a 5m‐kline WebSocket (ThreadedWebsocketManager) to receive each closed 5m bar instantly.
 Caches balance once every 3 hours and daily pivot once per UTC day to avoid REST rate limits.
-Exposes both "/" and "/health" endpoints on the PORT provided by Render (or defaults to 8000 locally).
+Exposes both “/” and “/health” endpoints on the PORT provided by Render (or defaults to 8000 locally).
 
 Setup:
  1) pip install -r requirements.txt
@@ -30,16 +30,22 @@ from binance.enums import *
 from binance import ThreadedWebsocketManager  # WebSocket manager
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  BOT CONFIGURATION & GLOBALS
+#   GLOBAL SETTINGS & CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-SYMBOL     = "BTCUSDT"
-LEVERAGE   = 100
-ATR_MULT   = 0.5
-MAX_BARS   = 10
-LOOKBACK_5 = 500
+SYMBOL       = "BTCUSDT"
+LEVERAGE     = 100
+TRADE_MARGIN = 5.0    # Temporarily only use $5 of margin per trade
+ATR_MULT     = 0.5
+MAX_BARS     = 10
+LOOKBACK_5   = 500
+
+# Precision for Binance USDT‐M BTCUSDT Futures:
+#   - Quantity stepSize = 0.001 → QTY_PREC = 3
+#   - Price tickSize   = 0.1   → PRICE_PREC = 1
 QTY_PREC   = 3
 PRICE_PREC = 1
+
 SLEEP_SEC  = 1
 TZ_UTC     = pytz.UTC
 
@@ -49,6 +55,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
+# Ensure API keys are set
 API_KEY    = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
@@ -56,6 +63,7 @@ if not API_KEY or not API_SECRET:
 
 client = Client(API_KEY, API_SECRET)
 
+# Bot state dictionary
 bot_state = {
     "in_position": False,
     "entry_price": None,
@@ -67,68 +75,73 @@ bot_state = {
     "entry_time": None
 }
 
-# In-memory 5m DataFrame (seeded once at startup, then appended via WebSocket)
+# In‐memory 5m DataFrame (seeded once at startup, appended via WebSocket)
 df5 = pd.DataFrame(
     columns=["open","high","low","close","volume"],
     index=pd.DatetimeIndex([], tz=TZ_UTC)
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  CACHES FOR BALANCE AND DAILY PIVOT
+#   CACHES FOR BALANCE & DAILY PIVOT
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Balance cache: fetch once every 3 hours
 balance_cache = {
-    "last_fetched": None,  # datetime (UTC)
+    "last_fetched": None,  # datetime UTC
     "value": None          # float
 }
 
 # Daily pivot cache: fetch once per UTC day
 pivot_cache = {
-    "date": None,    # pd.Timestamp (UTC, floored to midnight) representing "yesterday"
-    "value": None    # float: pivot for that date
+    "date": None,  # pd.Timestamp (UTC midnight of “yesterday”)
+    "value": None  # float pivot value
 }
 
 
 def get_cached_balance():
     """
-    Fetch futures USDT balance once every 3 hours. Reuse cached value otherwise.
+    Fetch futures USDT balance once every 3 hours; return cached otherwise.
     """
     global balance_cache
 
-    now_utc = datetime.now(pytz.UTC)
+    now_utc = datetime.now(TZ_UTC)
     if (balance_cache["last_fetched"] is None or
         (now_utc - balance_cache["last_fetched"]) > timedelta(hours=3)):
         try:
             bal_list = client.futures_account_balance()
             usdt_total = sum(
-                float(entry["balance"]) for entry in bal_list if entry["asset"].endswith("USDT")
+                float(entry["balance"]) for entry in bal_list if entry["asset"] == "USDT"
             )
-            balance_cache["value"] = usdt_total if usdt_total > 0 else 1000.0
+            # If Binance returns zero or negative, default to 1000 USDT
+            usdt_total = usdt_total if usdt_total > 0 else 1000.0
+            balance_cache["value"] = usdt_total
             balance_cache["last_fetched"] = now_utc
         except Exception as e:
-            logging.error(f"Could not fetch balance: {e}")
+            logging.error(f"Could not fetch futures USDT balance: {e}")
             if balance_cache["value"] is None:
                 balance_cache["value"] = 1000.0
             balance_cache["last_fetched"] = now_utc
+
     return balance_cache["value"]
 
 
 def fetch_daily_pivot():
     """
-    Returns yesterday's pivot = (prev_high + prev_low + prev_close)/3.
-    Caches result so we only call REST once per UTC day.
+    Returns yesterday’s pivot = (prev_high + prev_low + prev_close)/3.
+    Cached so we only call REST once per UTC day.
     """
     global pivot_cache
 
-    now_utc = datetime.now(pytz.UTC)
+    now_utc = datetime.now(TZ_UTC)
     today_mid = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday = today_mid - pd.Timedelta(days=1)
 
+    # If we already computed pivot for “yesterday,” reuse it
     if pivot_cache["date"] == yesterday:
         return pivot_cache["value"]
 
     try:
+        # Fetch the last 3 daily bars to be safe
         raw_1d = client.futures_klines(symbol=SYMBOL, interval="1d", limit=3)
         df1d = pd.DataFrame(raw_1d, columns=[
             "open_time","open","high","low","close","volume",
@@ -160,23 +173,32 @@ def fetch_daily_pivot():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  UTILITY: floor quantity & price
+#   FLOOR (truncate) QUANTITY & PRICE TO BINANCE PRECISION
 # ──────────────────────────────────────────────────────────────────────────────
 
 def floor_qty(qty_raw: float) -> float:
+    """
+    Floor raw quantity to QTY_PREC decimal places.
+    """
     factor = 10 ** QTY_PREC
     return math.floor(qty_raw * factor) / factor
 
 def floor_price(price_raw: float) -> float:
+    """
+    Floor raw price to PRICE_PREC decimal places.
+    """
     factor = 10 ** PRICE_PREC
     return math.floor(price_raw * factor) / factor
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FETCH and RESAMPLE 15m (from df5):
+#   FETCH & RESAMPLE 15m (FROM df5)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_15m_from_5m(local_df5: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample the 5m DataFrame into 15m OHLCV.
+    """
     df15 = pd.DataFrame()
     df15["open"]   = local_df5["open"].resample("15min").first()
     df15["high"]   = local_df5["high"].resample("15min").max()
@@ -187,10 +209,13 @@ def get_15m_from_5m(local_df5: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ORDER HELPERS (REST)
+#   ORDER HELPERS (REST)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def place_market_buy(qty: float):
+    """
+    Place a market BUY order for BTCUSDT futures with quantity floored to QTY_PREC.
+    """
     qty_f = floor_qty(qty)
     if qty_f <= 0:
         raise ValueError(f"Qty ≤ 0 ({qty}); cannot buy.")
@@ -202,6 +227,9 @@ def place_market_buy(qty: float):
     )
 
 def place_market_sell(qty: float):
+    """
+    Place a market SELL order (to close long) with quantity floored to QTY_PREC.
+    """
     qty_f = floor_qty(qty)
     if qty_f <= 0:
         raise ValueError(f"Qty ≤ 0 ({qty}); cannot sell.")
@@ -213,6 +241,10 @@ def place_market_sell(qty: float):
     )
 
 def place_limit_breakeven(qty: float, price: float, timeout: float = 2.0):
+    """
+    Place a LIMIT sell at breakeven (entry price), waiting up to 'timeout' seconds
+    for it to fill. If not filled, cancel and send a MARKET SELL.
+    """
     qty_f   = floor_qty(qty)
     price_f = floor_price(price)
     if qty_f <= 0:
@@ -232,6 +264,7 @@ def place_limit_breakeven(qty: float, price: float, timeout: float = 2.0):
         status = client.futures_get_order(symbol=SYMBOL, orderId=oid)
         if status["status"] == "FILLED":
             return status
+    # If still unfilled after 'timeout', cancel and send market:
     client.futures_cancel_order(symbol=SYMBOL, orderId=oid)
     return client.futures_create_order(
         symbol=SYMBOL,
@@ -242,13 +275,52 @@ def place_limit_breakeven(qty: float, price: float, timeout: float = 2.0):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  INDICATOR CALCULATIONS
+#   CAN_OPEN_POSITION: CHECK AVAILABLE MARGIN
+# ──────────────────────────────────────────────────────────────────────────────
+
+def can_open_position(qty: float, entry_price: float) -> bool:
+    """
+    Return True if availableBalance (USDT) ≥ required margin for qty @ entry_price at LEVERAGE.
+    Required margin = (qty × entry_price) / LEVERAGE.
+    """
+    try:
+        balances = client.futures_account_balance()
+        avail_bal = 0.0
+        for entry in balances:
+            if entry["asset"] == "USDT":
+                avail_bal = float(entry["availableBalance"])
+                break
+    except Exception as e:
+        logging.error(f"Could not fetch futures balance for margin check: {e}")
+        return False
+
+    notional = qty * entry_price
+    required_margin = notional / LEVERAGE
+
+    if required_margin <= avail_bal:
+        return True
+    else:
+        logging.warning(
+            f"Insufficient margin: required {required_margin:.4f} USDT "
+            f"but have only {avail_bal:.4f} USDT available."
+        )
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#   INDICATOR CALCULATIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given the 5m DataFrame (local_df5) and its 15m resample (df15),
+    compute all indicators: EMA9/21/50, RSI14, ADX14, ATR14, 15m EMA50,
+    VWAP, and Bullish Engulfing.
+    Return a new DataFrame with those columns, dropping any NaN rows.
+    """
     df = local_df5.copy().sort_index()
 
-    # 1) EMA 9/21/50 (5m)
+    # 1) EMA 9,21,50 (5m closes)
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -295,13 +367,14 @@ def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFr
     df["cum_vol"]   = df["volume"].groupby(df["date_only"]).cumsum()
     df["vwap"]      = df["cum_vp"] / df["cum_vol"]
 
-    # 7) Bullish Engulfing
+    # 7) Bullish Engulfing pattern
     df["open_prev"]  = df["open"].shift(1)
     df["close_prev"] = df["close"].shift(1)
     cond_prior_bear  = df["open_prev"] > df["close_prev"]
     cond_bull_eng    = cond_prior_bear & (df["open"] < df["close_prev"]) & (df["close"] > df["open_prev"])
     df["bull_engulf"] = cond_bull_eng.fillna(False)
 
+    # Select and return columns of interest
     cols = [
         "open","high","low","close","volume",
         "ema9","ema21","ema50",
@@ -312,37 +385,44 @@ def compute_indicators(local_df5: pd.DataFrame, df15: pd.DataFrame) -> pd.DataFr
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  STRATEGY (called on each new 5m bar)
+#   STRATEGY: RUN ON EACH CLOSED 5m BAR
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_strategy(local_df5: pd.DataFrame):
+    """
+    Called once for every new closed 5m bar (after df5 is appended).
+    1) Computes all indicators (5m+15m+1d).
+    2) If in_position: run exit logic (TP or breakeven after MAX_BARS).
+    3) If not in_position: check six entry conditions. If all true, size with $5 margin
+       at 100×, then place a market BUY. Otherwise log which flags failed.
+    """
     global bot_state
 
-    # 1) Get cached daily pivot
+    # 1) Fetch cached daily pivot
     pivot_val = fetch_daily_pivot()
 
-    # 2) Build 15m DataFrame by resampling local_df5
+    # 2) Build 15m DataFrame from local_df5
     df15 = get_15m_from_5m(local_df5)
 
-    # 3) Compute indicators (5m + 15m EMA50)
+    # 3) Compute indicators on 5m + 15m
     df_ind = compute_indicators(local_df5, df15)
     row    = df_ind.iloc[-1]
     ts     = row.name
     price      = float(row["close"])
     high_price = float(row["high"])
 
-    # ─── EXIT LOGIC ─────────────────────────────────────────────────────────────
+    # ─── EXIT LOGIC (if already in_position)──────────────────────────────────
     if bot_state["in_position"]:
         bot_state["bars_held"] += 1
         ep   = bot_state["entry_price"]
         tp   = bot_state["take_profit"]
         qty  = bot_state["quantity"]
 
-        # 1) Take profit
+        # 1) TAKE PROFIT: If high_price ≥ tp, market sell at tp
         if high_price >= tp:
             try:
                 place_market_sell(qty)
-                logging.info(f"TP hit: Sold {qty:.6f} @ {tp:.2f}")
+                logging.info(f"TP hit: Sold {qty:.3f} @ {tp:.1f}")
             except Exception as e:
                 logging.error(f"TP sell failed: {e}")
                 return
@@ -363,16 +443,16 @@ def run_strategy(local_df5: pd.DataFrame):
             })
             return
 
-        # 2) Breakeven after MAX_BARS
-        elif bot_state["bars_held"] >= MAX_BARS:
+        # 2) BREAKEVEN: If bars_held ≥ MAX_BARS and TP not hit, sell at entry price
+        if bot_state["bars_held"] >= MAX_BARS:
             try:
                 place_limit_breakeven(qty, ep, timeout=2.0)
-                logging.info(f"Breakeven exit: limit-sell {qty:.6f} @ {ep:.2f}")
+                logging.info(f"Breakeven limit-sell {qty:.3f} @ {ep:.1f}")
             except Exception as e:
                 logging.error(f"Breakeven limit-sell failed: {e}")
                 return
 
-            logging.info(f"Breakeven: Sold {qty:.6f} @ {ep:.2f} → Equity={bot_state['equity']:.2f}")
+            logging.info(f"Breakeven: Sold {qty:.3f} @ {ep:.1f} → Equity={bot_state['equity']:.2f}")
             bot_state.update({
                 "in_position": False,
                 "bars_held": 0,
@@ -383,10 +463,11 @@ def run_strategy(local_df5: pd.DataFrame):
                 "entry_time": None
             })
             return
-        else:
-            return  # still holding
 
-    # ─── ENTRY LOGIC ─────────────────────────────────────────────────────────────
+        # Otherwise, still in position—do nothing
+        return
+
+    # ─── ENTRY LOGIC (if NOT in_position)──────────────────────────────────────
     ema9     = float(row["ema9"])
     ema21    = float(row["ema21"])
     ema50    = float(row["ema50"])
@@ -405,15 +486,20 @@ def run_strategy(local_df5: pd.DataFrame):
     cond_pivot  = (price > pivot_val)
     cond_candle = bull_eng
 
-    # If all flags are true and ATR is valid, enter
+    # If all six conditions pass and ATR > 0, enter long
     if all([cond_ema, cond_mom, cond_15, cond_vwap, cond_pivot, cond_candle]) and atr > 0:
         entry_price = price
         take_profit = entry_price + ATR_MULT * atr
-        raw_qty     = (bot_state["equity"] * LEVERAGE) / entry_price
-        qty         = floor_qty(raw_qty)
 
+        # ─── SIZE POSITION USING $5 MARGIN AT 100× ──────────────────────
+        raw_qty = (TRADE_MARGIN * LEVERAGE) / entry_price
+        qty     = floor_qty(raw_qty)
         if qty <= 0:
-            logging.warning(f"Qty ≤ 0 ({raw_qty}); skipping entry.")
+            logging.warning(f"Computed qty ≤ 0 ({raw_qty}); skipping entry.")
+            return
+
+        # Check that available Futures margin ≥ $5
+        if not can_open_position(qty, entry_price):
             return
 
         try:
@@ -423,7 +509,10 @@ def run_strategy(local_df5: pd.DataFrame):
 
         try:
             place_market_buy(qty)
-            logging.info(f"Enter LONG {qty:.6f} @ {entry_price:.2f} (TP={take_profit:.2f}); ATR={atr:.2f}")
+            logging.info(
+                f"Enter LONG {qty:.3f} @ {entry_price:.1f} "
+                f"(TP={take_profit:.1f}); ATR={atr:.3f}"
+            )
         except Exception as e:
             logging.error(f"Entry buy failed: {e}")
             return
@@ -448,12 +537,13 @@ def run_strategy(local_df5: pd.DataFrame):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  WEBSOCKET CALLBACK (5m klines)
+#   WEBSOCKET CALLBACK (5m klines)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def handle_kline_message(msg):
     """
-    Called whenever a 5m kline closes. Appends to df5 and triggers run_strategy.
+    Called whenever a 5m kline update arrives.
+    Only fire when the kline is closed (msg['k']['x'] == True).
     """
     k = msg.get("k", {})
     if not k.get("x", False):
@@ -476,9 +566,12 @@ def handle_kline_message(msg):
         new_row["close"],
         new_row["volume"]
     ]
+
+    # Keep only the most recent LOOKBACK_5 rows
     if len(df5) > LOOKBACK_5:
         df5 = df5.iloc[-LOOKBACK_5 :]
 
+    # Once we have exactly LOOKBACK_5 bars, we can run the strategy
     if len(df5) == LOOKBACK_5:
         run_strategy(df5)
 
@@ -486,11 +579,11 @@ def handle_kline_message(msg):
 def start_kline_stream():
     """
     1) Seed df5 with the last LOOKBACK_5 bars via REST.
-    2) Start the WebSocket to receive new 5m bars.
+    2) Start the WebSocket to receive new 5m bars (ThreadedWebsocketManager).
     """
     global df5
 
-    # Seed 5m bars via REST
+    # Seed 5m bars using REST
     raw = client.futures_klines(symbol=SYMBOL, interval="5m", limit=LOOKBACK_5)
     temp = pd.DataFrame(raw, columns=[
         "open_time","open","high","low","close","volume",
@@ -506,7 +599,7 @@ def start_kline_stream():
 
     df5 = temp.copy()
 
-    # Start WebSocket (5m klines)
+    # Start WebSocket
     twm = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
     twm.start()
     twm.start_kline_socket(
@@ -518,7 +611,7 @@ def start_kline_stream():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  HEALTH SERVER (responds on "/" and "/health")
+#   HEALTH SERVER (for 24/7 uptime)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -542,6 +635,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+    """
+    Start a simple HTTP server on the port Render (or Replit) assigns in $PORT.
+    """
     raw_port = os.getenv("PORT", "8000")
     try:
         PORT = int(raw_port)
@@ -554,7 +650,7 @@ def start_health_server():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MAIN: initialize balance → launch health server → launch WebSocket
+#   MAIN: Initialize balance, start health server, launch WebSocket
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -563,13 +659,13 @@ def main():
     bot_state["equity"] = initial_balance
     logging.info(f"Starting equity: {initial_balance:.2f} USDT")
 
-    # 2) Start health server in background
+    # 2) Start health server in a daemon thread
     threading.Thread(target=start_health_server, daemon=True).start()
 
     # 3) Start the 5m WebSocket stream (blocks forever)
     start_kline_stream()
 
-    # Keep the main thread alive
+    # Keep the main thread alive as a fallback
     while True:
         time.sleep(SLEEP_SEC)
 
